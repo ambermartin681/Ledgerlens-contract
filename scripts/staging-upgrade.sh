@@ -105,7 +105,14 @@ NEW_WASM_PATH="${4:?ERROR: new-wasm-path argument is required}"
 
 TS() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { echo "[$(TS)] $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log"; }
-die() { echo "[$(TS)] ERROR: $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2; exit 1; }
+die() {
+  echo "[$(TS)] ERROR: $*" | tee -a "$EVIDENCE_DIR/staging-upgrade.log" >&2
+  # Fail closed: never leave the status file at a non-terminal value.
+  if [ "${STATUS_WRITTEN:-false}" = false ]; then
+    write_status "failed" "fail" "fail" "aborted: $*" || true
+  fi
+  exit 1
+}
 
 run() {
   if [ "$DRY_RUN" = true ]; then
@@ -143,6 +150,22 @@ fi
 mkdir -p "$EVIDENCE_DIR"
 : > "$EVIDENCE_DIR/staging-upgrade.log"
 
+# ── Terminal-status guarantee ───────────────────────────────────────────────
+# Every exit path must leave a terminal status in the status file. If the
+# script is interrupted (signal, unexpected non-zero exit) before a terminal
+# status was recorded, write `failed` so the file never stays at `pending`.
+STATUS_WRITTEN=false
+on_exit() {
+  local rc=$?
+  if [ "$STATUS_WRITTEN" = false ]; then
+    write_status "failed" "fail" "fail" "aborted before terminal status (exit=$rc)" || true
+  fi
+  return "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 CLI_BIN="$(detect_cli)"
 ADMIN_ADDRESS="$($CLI_BIN keys address "$ADMIN_IDENTITY" 2>/dev/null || echo '<ADMIN_ADDRESS>')"
 NEW_WASM_HASH="$(sha256sum "$NEW_WASM_PATH" | awk '{print $1}')"
@@ -169,6 +192,9 @@ invoke() {
 
 write_status() {
   # write_status <status> <health> <canary> <note>
+  # Writes atomically (temp file + rename) so an interrupted run never leaves a
+  # truncated status file, and marks STATUS_WRITTEN so the EXIT trap can tell
+  # whether a terminal status was already recorded.
   local status="$1" health="$2" canary="$3" note="$4"
   local version="unknown" commit_sha="${GITHUB_SHA:-unknown}" run_url="${GITHUB_RUN_URL:-unknown}"
   if [ "$DRY_RUN" = false ]; then
@@ -177,10 +203,9 @@ write_status() {
     version="<VERSION>"
   fi
   if command -v python3 >/dev/null 2>&1; then
-    STAGING_STATUS_FILE="$STAGING_STATUS_FILE" python3 - "$status" "$health" "$canary" "$note" "$CONTRACT_ID" "$NETWORK" "$NEW_WASM_HASH" "$PREVIOUS_WASM_HASH" "$version" "$commit_sha" "$run_url" <<'EOF'
-import json, sys, datetime
+    if STAGING_STATUS_FILE="$STAGING_STATUS_FILE" python3 - "$status" "$health" "$canary" "$note" "$CONTRACT_ID" "$NETWORK" "$NEW_WASM_HASH" "$PREVIOUS_WASM_HASH" "$version" "$commit_sha" "$run_url" <<'EOF'
+import json, sys, datetime, os, tempfile
 (status, health, canary, note, contract_id, network, wasm, prev_wasm, version, commit, run_url) = sys.argv[1:12]
-import os
 path = os.environ["STAGING_STATUS_FILE"]
 try:
     with open(path) as f:
@@ -202,11 +227,29 @@ data.update({
     "workflow_run_url": run_url,
     "last_deploy_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
 })
-with open(path, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
+directory = os.path.dirname(os.path.abspath(path)) or "."
+os.makedirs(directory, exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=directory, prefix=".staging-status.", suffix=".tmp")
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 print(f"staging status -> {path}: {status}")
 EOF
+    then
+      STATUS_WRITTEN=true
+    else
+      log "WARN: failed to update machine-readable status ($status/$health/$canary: $note)"
+    fi
   else
     log "WARN: python3 unavailable; skipping machine-readable status update ($status/$health/$canary: $note)"
   fi
@@ -225,6 +268,8 @@ rollback() {
     write_status "failed" "fail" "fail" "rollback unavailable: $reason"
     return 1
   fi
+  # From here on the outcome is terminal: rolled-back on healthy restore,
+  # failed otherwise. Both branches below write the status explicitly.
   log "Rolling back to $PREVIOUS_WASM ($PREVIOUS_WASM_HASH) via scripts/rollback.sh"
   if ! run bash "$SCRIPT_DIR/rollback.sh" --non-interactive \
       "$NETWORK" "$ADMIN_IDENTITY" "$CONTRACT_ID" "$PREVIOUS_WASM" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1; then
@@ -305,7 +350,10 @@ if [ "$NON_INTERACTIVE" = false ] && [ "$DRY_RUN" = false ]; then
 fi
 if ! EXEC_OUT="$(invoke execute_upgrade --admin-signers "[$ADMIN_ADDRESS]" 2>&1)"; then
   echo "$EXEC_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
-  rollback "execute_upgrade failed: $EXEC_OUT"
+  rollback "execute_upgrade failed: $EXEC_OUT" || true
+  if [ "$STATUS_WRITTEN" = false ]; then
+    write_status "failed" "fail" "fail" "execute_upgrade failed: $EXEC_OUT"
+  fi
   exit 1
 fi
 echo "$EXEC_OUT" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1 || true
@@ -319,17 +367,17 @@ if [ "$DRY_RUN" = false ]; then
   # must trigger the rollback path below, never a silent success.
   if [ "${STAGING_SMOKE_FAIL:-0}" = "1" ]; then
     log "STAGING_SMOKE_FAIL=1 — simulating post-deploy verification failure"
-    rollback "simulated verification failure (STAGING_SMOKE_FAIL=1)"
+    rollback "simulated verification failure (STAGING_SMOKE_FAIL=1)" || true
     exit 1
   fi
   if ! bash "$SCRIPT_DIR/health_check.sh" "$NETWORK" "$CONTRACT_ID" "$HEALTH_SOURCE" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1; then
-    rollback "post-deploy health check failed"
+    rollback "post-deploy health check failed" || true
     exit 1
   fi
   log "Health checks passed"
   log "Step 6: canary verification (verify-deployment.sh)"
   if ! bash "$SCRIPT_DIR/verify-deployment.sh" "$NETWORK" "$CONTRACT_ID" "$ADMIN_IDENTITY" >>"$EVIDENCE_DIR/staging-upgrade.log" 2>&1; then
-    rollback "post-deploy canary verification failed"
+    rollback "post-deploy canary verification failed" || true
     exit 1
   fi
   log "Canary verification passed"

@@ -80,9 +80,64 @@ fi
 
 # ── Step 2: Monitor the delay ─────────────────────────────────
 log "Step 2: Waiting for upgrade delay to elapse"
-log "   Check pending upgrade status with:"
-log "   soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTITY --network $NETWORK -- get_pending_upgrade"
-log "   Execute only after executable_after has passed."
+
+# Bounded polling of get_pending_upgrade until executable_after has passed.
+# Tunable via env vars so CI can shorten/lengthen the wait.
+ROLLBACK_POLL_INTERVAL="${ROLLBACK_POLL_INTERVAL:-5}"
+ROLLBACK_POLL_TIMEOUT="${ROLLBACK_POLL_TIMEOUT:-600}"
+
+# Extract a numeric field (e.g. executable_after) from get_pending_upgrade output.
+# The soroban CLI may render the result as JSON or as a plain scalar; handle both.
+extract_pending_field() {
+  local output="$1" field="$2"
+  printf '%s' "$output" | grep -o "\"${field}\"[[:space:]]*:[[:space:]]*[0-9]*" \
+    | head -n1 | grep -o '[0-9]*$'
+}
+
+if [ "$DRY_RUN" = true ]; then
+  echo "[dry-run] soroban contract invoke --id $TARGET_CONTRACT_ID --source $ADMIN_IDENTITY --network $NETWORK -- get_pending_upgrade"
+  echo "[dry-run] poll get_pending_upgrade every ${ROLLBACK_POLL_INTERVAL}s until executable_after (timeout ${ROLLBACK_POLL_TIMEOUT}s)"
+else
+  log "   Polling get_pending_upgrade every ${ROLLBACK_POLL_INTERVAL}s (timeout ${ROLLBACK_POLL_TIMEOUT}s)"
+  POLL_ELAPSED=0
+  EXECUTABLE_AFTER=""
+  while :; do
+    PENDING_OUTPUT=$(soroban contract invoke \
+      --id "$TARGET_CONTRACT_ID" \
+      --source "$ADMIN_IDENTITY" \
+      --network "$NETWORK" \
+      -- \
+      get_pending_upgrade 2>&1 || echo "PENDING_QUERY_FAILED")
+
+    if [ "$PENDING_OUTPUT" = "PENDING_QUERY_FAILED" ]; then
+      log "ERROR: get_pending_upgrade failed while waiting for rollback delay."
+      log "   Output: $PENDING_OUTPUT"
+      exit 1
+    fi
+
+    EXECUTABLE_AFTER=$(extract_pending_field "$PENDING_OUTPUT" "executable_after" || true)
+    if [ -z "$EXECUTABLE_AFTER" ]; then
+      log "ERROR: could not parse executable_after from get_pending_upgrade output."
+      log "   Output: $PENDING_OUTPUT"
+      exit 1
+    fi
+
+    NOW=$(date +%s)
+    if [ "$NOW" -ge "$EXECUTABLE_AFTER" ]; then
+      log "   Upgrade delay elapsed (executable_after=$EXECUTABLE_AFTER, now=$NOW)."
+      break
+    fi
+
+    if [ "$POLL_ELAPSED" -ge "$ROLLBACK_POLL_TIMEOUT" ]; then
+      log "ERROR: timed out after ${ROLLBACK_POLL_TIMEOUT}s waiting for executable_after=$EXECUTABLE_AFTER."
+      exit 1
+    fi
+
+    log "   Not yet executable (executable_after=$EXECUTABLE_AFTER, now=$NOW); sleeping ${ROLLBACK_POLL_INTERVAL}s."
+    sleep "$ROLLBACK_POLL_INTERVAL"
+    POLL_ELAPSED=$((POLL_ELAPSED + ROLLBACK_POLL_INTERVAL))
+  done
+fi
 
 # ── Step 3: Execute the rollback ──────────────────────────────
 if [ "$NON_INTERACTIVE" = true ]; then
@@ -136,6 +191,24 @@ if [ "$DRY_RUN" = false ]; then
   fi
 
   log "Rollback admin verified: $VERIFY_ADMIN"
+fi
+
+# ── Step 4b: Health check the restored instance ───────────────
+log "Step 4b: Running health checks against rolled-back contract"
+HEALTH_CHECK_SCRIPT="$PROJECT_ROOT/scripts/health_check.sh"
+if [ ! -f "$HEALTH_CHECK_SCRIPT" ]; then
+  log "ERROR: health_check.sh not found at $HEALTH_CHECK_SCRIPT — cannot verify rollback."
+  exit 1
+fi
+
+if [ "$DRY_RUN" = true ]; then
+  echo "[dry-run] $HEALTH_CHECK_SCRIPT $NETWORK $TARGET_CONTRACT_ID"
+else
+  if ! "$HEALTH_CHECK_SCRIPT" "$NETWORK" "$TARGET_CONTRACT_ID"; then
+    log "ERROR: health checks failed after rollback — restored instance is not healthy."
+    exit 1
+  fi
+  log "Health checks passed against rolled-back contract."
 fi
 
 # ── Step 5: Replay verification ───────────────────────────────

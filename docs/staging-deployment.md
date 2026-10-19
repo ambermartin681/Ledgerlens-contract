@@ -110,6 +110,18 @@ rehearsal hook used by `scripts/test-staging-deploy.sh` to prove the path).
 3. The previous WASM for run N+1 is always the artifact of the last green
    run, so repeated failures converge rather than compounding.
 
+### Terminal status guarantee
+
+A failed staging run **always** records a terminal status — either
+`rolled-back` (previous WASM restored and re-verified) or `failed` (manual
+intervention required) — and **never leaves `pending`** in
+`deploy/staging.json`. `pending` is only the initial placeholder written
+before a run starts; the workflow's final status-publish step overwrites it
+on every outcome, including failures and rollbacks. If a failure issue shows
+`pending`, the run did not reach its status-publish step (e.g. cancelled or
+infrastructure failure) — treat it as `failed` and investigate per §8.
+=======
+
 `rollback.sh --non-interactive` (new in this change) only skips the *execute*
 prompt on non-mainnet networks; a mainnet rollback still refuses to run
 non-interactively and requires the typed confirmation. Interactive behaviour
@@ -177,15 +189,29 @@ Rules:
 
 ### Responding to a staging failure issue
 
-1. Download `staging-deployment-evidence` from the linked run; read
-   `staging-upgrade.log` top-down (baseline → propose → execute → verify).
-2. If status is `rolled-back`: confirm post-rollback health passed in the
-   log, verify `deploy/staging.json` matches on-chain (`health_check.sh`
-   manually), then fix forward on a branch — the next merge redeploys.
-3. If status is `failed` or `proposed-pending` for >1 delay window: follow
-   `docs/incident-response-runbook.md` (freeze if needed, snapshots,
-   reconcile) before re-running.
-4. Close the loop on the issue with the root cause and the green run link.
+Every staging failure issue (e.g. #1493, #1494, #1495, #1496) is investigated
+with the same steps:
+
+1. Open the run link in the issue, download the
+   `staging-deployment-evidence` artifact, and read `staging-upgrade.log`
+   top-down (baseline → propose → execute → verify → rollback).
+2. Check `deploy/staging.json` for the recorded status. A failed run is
+   always terminal — `rolled-back` or `failed`, never `pending` (see §5).
+   - `rolled-back`: the previous WASM was restored and re-verified by the
+     health checks. Confirm post-rollback health passed in the log, verify
+     `deploy/staging.json` matches on-chain (`health_check.sh` manually),
+     then fix forward on a branch — the next merge redeploys.
+   - `failed`: manual intervention is required. Follow
+     `docs/incident-response-runbook.md` (freeze if needed, snapshots,
+     reconcile) before re-running.
+   - `pending`: the run did not reach its status-publish step; treat as
+     `failed` and investigate the run itself.
+3. If status is `proposed-pending` for >1 delay window, follow
+   `docs/incident-response-runbook.md` before re-running.
+4. **Do not promote the failing commit further until staging is green
+   again.** No additional merges, releases, or promotions from that commit
+   until a subsequent run records `deployed` with passing health and canary.
+5. Close the loop on the issue with the root cause and the green run link.
 
 ### Local rehearsal (no network)
 

@@ -178,6 +178,77 @@ else
   not_ok "broken change records rolled-back in the status file"
 fi
 
+# ── 5. Failure-path guarantees: status is never left `pending` ────────────
+# Terminal statuses are the only ones a failure may record; `pending` means
+# the workflow died before recording an outcome (the #1236/#1493 symptom).
+assert_terminal_status() {
+  local desc="$1" file="$2"
+  if python3 -c "import json,sys; s=json.load(open(sys.argv[1]))['status']; assert s in ('failed','rolled-back'), s" "$file" 2>/dev/null; then
+    ok
+  else
+    not_ok "$desc (status must be failed or rolled-back, never pending)"
+  fi
+}
+
+# 5a. Broken change (smoke failure) already ran above; re-assert terminality.
+assert_terminal_status "broken change leaves a terminal status" "$STATUS_FILE"
+
+# 5b. Baseline-health failure: the pre-upgrade health check fails, so the
+# upgrade must abort and record a terminal status (not `pending`).
+BASELINE_STUB_DIR="$TMP_DIR/stubs-baseline"
+mkdir -p "$BASELINE_STUB_DIR"
+cat > "$BASELINE_STUB_DIR/soroban" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "keys" ]; then
+  echo "GSTAGINGADMINXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+  exit 0
+fi
+fn=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--" ]; then fn="$arg"; break; fi
+  prev="$arg"
+done
+case "$fn" in
+  get_admin) echo "GSTAGINGADMINXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" ;;
+  get_service) echo "GSTAGINGSERVICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX" ;;
+  is_paused) echo "false" ;;
+  get_version) echo "4" ;;
+  is_service_alive) echo "false" ;;
+  get_pending_upgrade) echo "error: HostError: Error(Contract, #13)" >&2; exit 1 ;;
+  propose_upgrade) echo "upgrade proposed" ;;
+  execute_upgrade) echo "upgrade executed" ;;
+  *) echo "stub: unknown function '$fn'" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$BASELINE_STUB_DIR/soroban"
+cat > "$BASELINE_STUB_DIR/stellar" <<'STUB'
+#!/usr/bin/env bash
+exec soroban "$@"
+STUB
+chmod +x "$BASELINE_STUB_DIR/stellar"
+
+BASELINE_STATUS="$TMP_DIR/staging-baseline.json"
+BASELINE_LOG="$TMP_DIR/baseline.log"
+set +e
+PATH="$BASELINE_STUB_DIR:$PATH" STAGING_ALLOW_SKIP_DELAY_WAIT=1 \
+  "$UPGRADE_SCRIPT" --non-interactive --skip-delay-wait \
+  --evidence-dir "$EVIDENCE_DIR" --staging-status "$BASELINE_STATUS" \
+  --previous-wasm "$TMP_DIR/prev.wasm" \
+  testnet staging-deployer CSTAGINGXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX \
+  "$TMP_DIR/new.wasm" >"$BASELINE_LOG" 2>&1
+BASELINE_CODE=$?
+set -e
+
+if [ "$BASELINE_CODE" -ne 0 ]; then ok; else not_ok "baseline-health failure exits non-zero (got $BASELINE_CODE)"; fi
+assert_terminal_status "baseline-health failure leaves a terminal status" "$BASELINE_STATUS"
+
+# 5c. The workflow's notify step must run on failure and see a non-pending
+# status, so maintainers are never told "pending" after a failed promotion.
+assert_contains "workflow notifies on failure" "$WORKFLOW" "if: failure()"
+assert_contains "notify step reads the recorded status" "$WORKFLOW" "deploy/staging.json"
+assert_not_contains "workflow never hardcodes a pending status" "$WORKFLOW" '"status": "pending"'
+
 echo ""
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

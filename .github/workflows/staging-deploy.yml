@@ -221,6 +221,43 @@ jobs:
           fi
           exit "$CODE"
 
+      - name: Finalize staging status (never leave pending)
+        if: always()
+        env:
+          UPGRADE_OUTCOME: ${{ steps.upgrade.outcome }}
+          DEPLOY_SHA: ${{ needs.gate.outputs.deploy_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+
+          path = "deploy/staging.json"
+          with open(path) as f:
+              data = json.load(f)
+
+          outcome = os.environ.get("UPGRADE_OUTCOME", "")
+          status = data.get("status", "pending")
+
+          # A run that did not finish the upgrade cleanly must never leave the
+          # placeholder `pending` status behind: record a terminal status so
+          # the failure notice and deploy/staging.json agree.
+          if outcome != "success" and status == "pending":
+              data["status"] = "failed"
+              data["note"] = (
+                  "Upgrade step outcome: %s. Staging did not reach verified status; "
+                  "manual intervention may be required (see docs/staging-deployment.md § Rollback)."
+                  % (outcome or "skipped")
+              )
+              data["commit"] = os.environ.get("DEPLOY_SHA", "")
+              data["run_url"] = os.environ.get("RUN_URL", "")
+              with open(path, "w") as f:
+                  json.dump(data, f, indent=2)
+                  f.write("\n")
+              print("Rewrote staging.json status: pending -> failed (upgrade outcome: %s)" % outcome)
+          else:
+              print("staging.json status unchanged: %s (upgrade outcome: %s)" % (status, outcome))
+          EOF
+
       - name: Publish staging status file
         if: always()
         run: |
@@ -236,6 +273,7 @@ jobs:
           assert not missing, f"staging.json missing required keys: {missing}"
           assert data["network"] in ("testnet", "futurenet"), "staging must never target mainnet"
           assert data["status"] in schema["properties"]["status"]["enum"]
+          assert data["status"] != "pending", "a finished staging run must not leave status=pending"
           print("staging.json schema check passed.")
           EOF
 
@@ -270,12 +308,43 @@ jobs:
             target/wasm32-unknown-unknown/release/ledgerlens_score.optimized.wasm
           retention-days: 90
 
+      # Runs after "Upload deployment evidence" so the artifact referenced in
+      # the issue body is already available on the run.
       - name: Notify maintainers on failure
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_SHA: ${{ needs.gate.outputs.deploy_sha }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          # Fallback: if the status file is still the `pending` placeholder
+          # (e.g. the upgrade step was skipped or crashed before finalizing),
+          # write a terminal `failed` status before notifying so the issue
+          # never reports `pending`.
+          python3 - <<'EOF'
+          import json, os
+
+          path = "deploy/staging.json"
+          try:
+              with open(path) as f:
+                  data = json.load(f)
+          except (OSError, ValueError):
+              data = {"status": "pending"}
+
+          if data.get("status", "pending") == "pending":
+              data["status"] = "failed"
+              data["note"] = (
+                  "Staging deployment did not reach verified status; the upgrade step "
+                  "did not finalize. Manual intervention may be required "
+                  "(see docs/staging-deployment.md § Rollback)."
+              )
+              data["commit"] = os.environ.get("DEPLOY_SHA", "")
+              data["run_url"] = os.environ.get("RUN_URL", "")
+              with open(path, "w") as f:
+                  json.dump(data, f, indent=2)
+                  f.write("\n")
+              print("Fallback: staging.json status rewritten pending -> failed.")
+          EOF
           STATUS="$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('status','unknown'))" 2>/dev/null || echo unknown)"
           NOTE="$(python3 -c "import json;print(json.load(open('deploy/staging.json')).get('note',''))" 2>/dev/null || echo '')"
           BODY="$(cat <<EOF
